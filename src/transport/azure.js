@@ -12,17 +12,24 @@ const AbstractTransport = require("./abstract");
 class AzureTransport extends AbstractTransport {
   /**
    * @param {Object} options
-   * @param {string} options.account
-   * @param {string} options.accountKey
-   * @param {string} options.containerName
-   * @param {string} options.remoteUrl
-   * @param {string} options.remotePath
+   * @param {string} options.account REQUIRED
+   * @param {string} options.accountKey REQUIRED
+   * @param {string} options.containerName REQUIRED
+   * @param {string} options.blobUrl defaults to `https://${options.account}.blob.core.windows.net`
+   * @param {string} options.remoteUrl http accessible url (computed automatically if not defined)
+   * @param {string} options.remotePath "prefix" inside the azure container
    */
   normalizeOptions(options) {
+    if (options.remotePath && !options.remotePath.endsWith("/")) {
+      options.remotePath += "/";
+    } else if (!options.remotePath) {
+      options.remotePath = "";
+    }
+
     if (!options.containerName) {
       throw new Error("Container name is required.");
     }
-    
+
     if (!options.blobUrl) {
       options.blobUrl = `https://${options.account}.blob.core.windows.net`;
     }
@@ -31,26 +38,22 @@ class AzureTransport extends AbstractTransport {
       options.remoteUrl = `${options.blobUrl}/${options.containerName}/${options.remotePath}`;
     }
 
-    if (!options.outPath) {
-      options.outPath = "";
-    }
-
     super.normalizeOptions(options);
   }
 
   init() {
     this.sharedKeyCredential = new StorageSharedKeyCredential(
-      options.account,
-      options.accountKey
+      this.options.account,
+      this.options.accountKey
     );
 
     this.blobServiceClient = new BlobServiceClient(
-      options.blobUrl,
-      sharedKeyCredential
+      this.options.blobUrl,
+      this.sharedKeyCredential
     );
 
-    this.containerClient = blobServiceClient.getContainerClient(
-      options.containerName
+    this.containerClient = this.blobServiceClient.getContainerClient(
+      this.options.containerName
     );
 
     super.init();
@@ -63,26 +66,42 @@ class AzureTransport extends AbstractTransport {
    * @param {object} build
    * @return {Promise<string>} File url
    */
-  uploadFile(filePath, build) {
+  async uploadFile(filePath, build) {
     const outPath = this.getOutFilePath(filePath, build);
-    console.log("FILEPATH", filePath);
-    console.log("OUTPATH", outPath);
-    return Promise.resolve("");
-    //return copyFile(filePath, outPath).then(() =>
-    //  this.getFileUrl(filePath, build)
-    //);
+
+    console.log("uploadFile - FILEPATH", filePath);
+    console.log("uploadFile - OUTPATH", outPath);
+    console.log("UPLOAD STARTING");
+
+    const blockBlobClient = this.containerClient.getBlockBlobClient(outPath);
+    const uploadResponse = await blockBlobClient.uploadFile(filePath);
+    console.log("UPLOAD DONE");
+    console.log("RESPONSE:", uploadResponse);
+
+    return Promise.resolve(
+      path.posix.join(this.options.blobUrl, this.options.containerName, outPath)
+    );
   }
 
   /**
    * Save updates.json to a hosting
    * @return {Promise<string>} Url to updates.json
    */
-  pushUpdatesJson(data) {
-    const outPath = path.join(this.options.outPath, "updates.json");
-    console.log("OUTPATH", outPath);
-    //mkdirp(this.options.outPath);
+  async pushUpdatesJson(data) {
+    const outPath = path.join(this.options.remotePath, "updates.json");
+    console.log("pushUpdatesJson - OUTPATH", outPath);
 
-    //fs.writeFileSync(outPath, JSON.stringify(data, null, "  "));
+    console.log("UPLOAD STARTING");
+    const blockBlobClient = this.containerClient.getBlockBlobClient(outPath);
+    const updatesJson = JSON.stringify(data, null, "  ");
+    const uploadResponse = await blockBlobClient.upload(
+      updatesJson,
+      Buffer.byteLength(updatesJson)
+    );
+    console.log("UPLOAD DONE");
+    console.log(updatesJson);
+    console.log("RESPONSE:", uploadResponse);
+
     return Promise.resolve();
   }
 
@@ -91,21 +110,19 @@ class AzureTransport extends AbstractTransport {
    */
   async fetchBuildsList() {
     let builds = [];
-    for await (const blob of containerClient.listBlobsFlat()) {
-      // @TODO: Only add directories
-      console.log("A blob:", blob);
-      builds.push(blob.name);
+    for await (const blob of this.containerClient.listBlobsByHierarchy("/", {
+      prefix: this.options.remotePath
+    })) {
+      if (blob.kind !== "prefix") continue;
+      // Remove prefix and ending / from name
+      const name = blob.name.slice(
+        this.options.remotePath.length,
+        blob.name.length - 1
+      );
+      if (name.match(/^\w+-\w+-\w+-[\w.]+$/)) {
+        builds.push(name);
+      }
     }
-    /*
-    try {
-      builds = fs.readdirSync(this.options.outPath).filter(file => {
-        const stat = fs.statSync(path.join(this.options.outPath, file));
-        return stat.isDirectory();
-      });
-    } catch (e) {
-      builds = [];
-    }
-    */
 
     return Promise.resolve(builds);
   }
@@ -113,18 +130,30 @@ class AzureTransport extends AbstractTransport {
   /**
    * @return {Promise}
    */
-  removeBuild(build, resolveName = true) {
-    /*
+  async removeBuild(build, resolveName = true) {
     const buildId = resolveName ? this.getBuildId(build) : build;
-    rmDir(path.join(this.options.outPath, buildId));
-    */
+    const outPath = path.posix.join(this.options.remotePath, buildId);
+    console.log("removeBuild - OUTPATH", outPath);
+
+    for await (const blob of this.containerClient.listBlobsFlat({
+      prefix: outPath
+    })) {
+      const blockBlobClient = this.containerClient.getBlockBlobClient(
+        blob.name
+      );
+      const response = await blockBlobClient.delete({
+        deleteSnapshots: "include"
+      });
+      console.log("DELETE RESPONSE:", response);
+    }
+
     return Promise.resolve();
   }
 
   getOutFilePath(localFilePath, build) {
     localFilePath = path.basename(localFilePath);
     return path.posix.join(
-      this.options.outPath,
+      this.options.remotePath,
       this.getBuildId(build),
       this.normalizeFileName(localFilePath)
     );
