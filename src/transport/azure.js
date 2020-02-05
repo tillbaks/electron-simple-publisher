@@ -20,14 +20,16 @@ class AzureTransport extends AbstractTransport {
    * @param {string} options.remotePath "prefix" inside the azure container
    */
   normalizeOptions(options) {
+    if (!options.containerName) {
+      throw new Error("Container name is required.");
+    } else if (!options.account || !options.accountKey) {
+      throw new Error("Please provide your azure storage account and key.");
+    }
+
     if (options.remotePath && !options.remotePath.endsWith("/")) {
       options.remotePath += "/";
     } else if (!options.remotePath) {
       options.remotePath = "";
-    }
-
-    if (!options.containerName) {
-      throw new Error("Container name is required.");
     }
 
     if (!options.blobUrl) {
@@ -68,19 +70,18 @@ class AzureTransport extends AbstractTransport {
    */
   async uploadFile(filePath, build) {
     const outPath = this.getOutFilePath(filePath, build);
-
-    console.log("uploadFile - FILEPATH", filePath);
-    console.log("uploadFile - OUTPATH", outPath);
-    console.log("UPLOAD STARTING");
-
-    const blockBlobClient = this.containerClient.getBlockBlobClient(outPath);
-    const uploadResponse = await blockBlobClient.uploadFile(filePath);
-    console.log("UPLOAD DONE");
-    console.log("RESPONSE:", uploadResponse);
-
-    return Promise.resolve(
-      path.posix.join(this.options.blobUrl, this.options.containerName, outPath)
-    );
+    try {
+      const blockBlobClient = this.containerClient.getBlockBlobClient(outPath);
+      await blockBlobClient.uploadFile(filePath);
+      return path.posix.join(
+        this.options.blobUrl,
+        this.options.containerName,
+        outPath
+      );
+    } catch (e) {
+      console.warn(`Couldn't upload ${filePath}: ${e.message}`);
+      throw e;
+    }
   }
 
   /**
@@ -89,65 +90,72 @@ class AzureTransport extends AbstractTransport {
    */
   async pushUpdatesJson(data) {
     const outPath = path.join(this.options.remotePath, "updates.json");
-    console.log("pushUpdatesJson - OUTPATH", outPath);
-
-    console.log("UPLOAD STARTING");
-    const blockBlobClient = this.containerClient.getBlockBlobClient(outPath);
-    const updatesJson = JSON.stringify(data, null, "  ");
-    const uploadResponse = await blockBlobClient.upload(
-      updatesJson,
-      Buffer.byteLength(updatesJson)
-    );
-    console.log("UPLOAD DONE");
-    console.log(updatesJson);
-    console.log("RESPONSE:", uploadResponse);
-
-    return Promise.resolve();
+    try {
+      const blockBlobClient = this.containerClient.getBlockBlobClient(outPath);
+      const updatesJson = JSON.stringify(data, null, "  ");
+      await blockBlobClient.upload(updatesJson, Buffer.byteLength(updatesJson));
+      return;
+    } catch (e) {
+      console.warn(`Couldn't upload updates.json: ${e.message}`);
+      throw e;
+    }
   }
 
   /**
    * @return {Promise<Array<string>>}
    */
   async fetchBuildsList() {
-    let builds = [];
-    for await (const blob of this.containerClient.listBlobsByHierarchy("/", {
-      prefix: this.options.remotePath
-    })) {
-      if (blob.kind !== "prefix") continue;
-      // Remove prefix and ending / from name
-      const name = blob.name.slice(
-        this.options.remotePath.length,
-        blob.name.length - 1
-      );
-      if (name.match(/^\w+-\w+-\w+-[\w.]+$/)) {
-        builds.push(name);
+    try {
+      let builds = [];
+      for await (const blob of this.containerClient.listBlobsByHierarchy("/", {
+        prefix: this.options.remotePath
+      })) {
+        if (blob.kind !== "prefix") continue;
+        // Remove prefix and ending / from name
+        const name = blob.name.slice(
+          this.options.remotePath.length,
+          blob.name.length - 1
+        );
+        if (name.match(/^\w+-\w+-\w+-[\w.]+$/)) {
+          builds.push(name);
+        }
       }
+      return Promise.resolve(builds);
+    } catch (e) {
+      console.warn(`Couldn't list builds: ${e.message}`);
+      throw e;
     }
-
-    return Promise.resolve(builds);
   }
 
   /**
    * @return {Promise}
    */
   async removeBuild(build, resolveName = true) {
-    const buildId = resolveName ? this.getBuildId(build) : build;
-    const outPath = path.posix.join(this.options.remotePath, buildId);
-    console.log("removeBuild - OUTPATH", outPath);
+    try {
+      const buildId = resolveName ? this.getBuildId(build) : build;
+      const outPath = path.posix.join(this.options.remotePath, buildId);
 
-    for await (const blob of this.containerClient.listBlobsFlat({
-      prefix: outPath
-    })) {
-      const blockBlobClient = this.containerClient.getBlockBlobClient(
-        blob.name
-      );
-      const response = await blockBlobClient.delete({
-        deleteSnapshots: "include"
-      });
-      console.log("DELETE RESPONSE:", response);
+      for await (const blob of this.containerClient.listBlobsFlat({
+        prefix: outPath
+      })) {
+        try {
+          const blockBlobClient = this.containerClient.getBlockBlobClient(
+            blob.name
+          );
+          await blockBlobClient.delete({
+            deleteSnapshots: "include"
+          });
+        } catch (e) {
+          console.warn(`Couldn't remove file ${blob.name}: ${e.message}`);
+          throw e;
+        }
+      }
+
+      return Promise.resolve();
+    } catch (e) {
+      console.warn(`Couldn't list builds: ${e.message}`);
+      throw e;
     }
-
-    return Promise.resolve();
   }
 
   getOutFilePath(localFilePath, build) {
